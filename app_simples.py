@@ -125,11 +125,11 @@ if uploaded_file:
                 
                 logger.info(f"Arquivo temporário: {tmp_path}")
                 
-                # Cria processador (SEM busca de coordenadas = RÁPIDO)
+                # Cria processador (COM busca automática de coordenadas)
                 processor = CSVProcessor(
                     chunk_size=chunk_size,
                     use_cache=True,
-                    fetch_coordinates=False  # 🔑 DESABILITADO = RÁPIDO
+                    fetch_coordinates=True  # ✅ Busca automática de coordenadas
                 )
                 
                 # Processa

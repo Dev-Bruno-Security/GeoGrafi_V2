@@ -97,7 +97,8 @@ with tab1:
                         chunk_size=config.processing.chunk_size,
                         max_workers=config.processing.max_workers,
                         use_cache=config.processing.use_cache,
-                        cache_db=config.processing.cache_db_path
+                        cache_db=config.processing.cache_db_path,
+                        fetch_coordinates=True  # ✅ Busca automática de coordenadas
                     )
                     
                     # Container para progresso
@@ -112,14 +113,14 @@ with tab1:
                             status_text.text(f"Processando: {progress:.1f}%")
                         
                         # Processa arquivo
-                        result = processor.process_file(
+                        result_df = processor.process_file(
                             tmp_path,
                             progress_callback=update_progress
                         )
                     
                     # Armazena resultados
-                    st.session_state.result_df = result['dataframe']
-                    st.session_state.stats = result['stats']
+                    st.session_state.result_df = result_df
+                    st.session_state.stats = processor.stats
                     st.session_state.file_processed = True
                     
                     # Limpa progresso
@@ -160,20 +161,32 @@ with tab1:
                 )
             
             with col2:
-                # Baixar apenas registros com coordenadas
-                df_with_coords = st.session_state.result_df[
-                    st.session_state.result_df['DS_LATITUDE'].notna() &
-                    st.session_state.result_df['DS_LONGITUDE'].notna()
-                ]
+                # Baixar apenas registros com coordenadas (se as colunas existirem)
+                has_lat = 'DS_LATITUDE' in st.session_state.result_df.columns
+                has_lon = 'DS_LONGITUDE' in st.session_state.result_df.columns
+                has_lat_correta = 'DS_LATITUDE_CORRETA' in st.session_state.result_df.columns
+                has_lon_correta = 'DS_LONGITUDE_CORRETA' in st.session_state.result_df.columns
                 
-                if not df_with_coords.empty:
-                    create_download_button(
-                        df_with_coords,
-                        filename="resultado_com_coordenadas.csv",
-                        label="📥 Baixar apenas com Coordenadas"
-                    )
+                if (has_lat and has_lon) or (has_lat_correta and has_lon_correta):
+                    # Usa colunas corretas se disponíveis, senão usa as originais
+                    lat_col = 'DS_LATITUDE_CORRETA' if has_lat_correta else 'DS_LATITUDE'
+                    lon_col = 'DS_LONGITUDE_CORRETA' if has_lon_correta else 'DS_LONGITUDE'
+                    
+                    df_with_coords = st.session_state.result_df[
+                        st.session_state.result_df[lat_col].notna() &
+                        st.session_state.result_df[lon_col].notna()
+                    ]
+                    
+                    if not df_with_coords.empty:
+                        create_download_button(
+                            df_with_coords,
+                            filename="resultado_com_coordenadas.csv",
+                            label="📥 Baixar apenas com Coordenadas"
+                        )
+                    else:
+                        st.info("Nenhum registro com coordenadas")
                 else:
-                    st.info("Nenhum registro com coordenadas")
+                    st.info("💡 As coordenadas são buscadas automaticamente durante o processamento")
 
 with tab2:
     st.subheader("ℹ️ Sobre o GeoGrafi")
@@ -183,8 +196,8 @@ with tab2:
     
     ### Funcionalidades
     
-    - ✅ **Validação de CEP**: Verifica e corrige CEPs usando ViaCEP
-    - 🗺️ **Geocoding**: Adiciona coordenadas (latitude/longitude) usando Nominatim
+    - ✅ **Validação de CEP**: Verifica e corrige CEPs usando ViaCEP (automático)
+    - 🗺️ **Geocoding**: Adiciona coordenadas (latitude/longitude) usando Nominatim (automático)
     - 🔄 **Processamento em Chunks**: Suporta arquivos grandes com baixo uso de memória
     - 💾 **Cache Local**: Armazena resultados para acelerar processamento
     - ⚡ **Processamento Paralelo**: Usa múltiplas threads para maior velocidade

@@ -8,6 +8,10 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 import chardet
+import csv
+import re
+import time
+import requests
 
 from .cep_validator import CEPValidator
 from .geocoder import Geocoder
@@ -181,12 +185,16 @@ class CSVProcessor:
         
         return text.strip()
     
-    def process_file(self, file_path: str) -> pd.DataFrame:
+    def process_file(self, file_path: str, progress_callback: Optional[Callable[[float], None]] = None) -> pd.DataFrame:
         """
         Processa arquivo CSV RAPIDAMENTE.
         
         Se fetch_coordinates=False (padrão): Apenas valida CEPs (~0.1s por item)
         Se fetch_coordinates=True: Também busca coordenadas (LENTO: ~2-3s por item)
+        
+        Args:
+            file_path: Caminho do arquivo CSV
+            progress_callback: Função opcional para reportar progresso (0-100)
         
         Returns:
             DataFrame com coluna 'cep_valido' adicionada
@@ -249,6 +257,7 @@ class CSVProcessor:
         df['uf'] = None
         
         # Processa cada linha
+        total_rows = len(df)
         for idx, row in df.iterrows():
             cep_original = str(row[cep_col]).strip()
             
@@ -270,12 +279,36 @@ class CSVProcessor:
                 # Se ViaCEP não trouxe logradouro/bairro, tenta usar o endereço original padronizado
                 self._backfill_from_original(df, idx)
             else:
-                # CEP inválido
+                # CEP inválido - NOVA: Tenta buscar CEP pelo endereço
                 df.at[idx, 'cep_valido'] = False
                 df.at[idx, 'cep_corrigido'] = cep_original
+                
+                # Tenta buscar CEP usando endereço disponível
+                cep_by_address = self._search_cep_by_address(df, idx)
+                if cep_by_address:
+                    logger.info(f"CEP encontrado pelo endereço: {cep_by_address}")
+                    df.at[idx, 'cep_corrigido'] = cep_by_address
+                    # Busca novamente os dados do ViaCEP com o CEP encontrado
+                    cep_info = self.cep_validator.search_cep(cep_by_address)
+                    if cep_info and not cep_info.get('erro'):
+                        df.at[idx, 'cep_valido'] = True
+                        df.at[idx, 'logradouro'] = cep_info.get('logradouro', '')
+                        df.at[idx, 'bairro'] = cep_info.get('bairro', '')
+                        df.at[idx, 'cidade'] = cep_info.get('localidade', '')
+                        df.at[idx, 'uf'] = cep_info.get('uf', '')
+                        self._backfill_row_from_cep(df, idx, cep_info)
+            
+            # Reporta progresso (FASE 1: 0-70%)
+            if progress_callback and (idx + 1) % 10 == 0:
+                progress = ((idx + 1) / total_rows) * 70.0
+                progress_callback(progress)
 
         # Preenche campos vazios de endereço a partir das informações corrigidas do CEP
         df = self._fill_missing_address_fields(df)
+        
+        # Reporta progresso após preenchimento (70%)
+        if progress_callback:
+            progress_callback(70.0)
         
         valid_count = (df['cep_valido'] == True).sum()
         logger.info(f"✓ {valid_count}/{len(df)} CEPs válidos em {time.time()-phase1_start:.1f}s")
@@ -313,11 +346,20 @@ class CSVProcessor:
                     if pd.isna(df.at[idx, 'DS_LONGITUDE']) or str(df.at[idx, 'DS_LONGITUDE']).strip() == '':
                         df.at[idx, 'DS_LONGITUDE'] = lon
                     self.stats['found_coordinates'] += 1
+                
+                # Reporta progresso (FASE 2: 70-100%)
+                if progress_callback and (idx + 1) % 5 == 0:
+                    progress = 70.0 + ((idx + 1) / total_rows) * 30.0
+                    progress_callback(progress)
             
             logger.info(f"✓ Coordenadas buscadas em {time.time()-phase2_start:.1f}s")
         
         total = time.time() - start
         logger.info(f"✓ Processamento concluído em {total:.1f}s")
+        
+        # Reporta conclusão (100%)
+        if progress_callback:
+            progress_callback(100.0)
         
         return df
 
@@ -706,28 +748,36 @@ class CSVProcessor:
         
         return chunk
     
-    def _search_cep_by_address(self, row: pd.Series) -> Optional[str]:
-        """Busca CEP correto usando endereço através de busca na ViaCEP"""
-        street = str(row.get('NM_LOGRADOURO', '')).strip()
-        city = str(row.get('NM_MUNICIPIO', '')).strip()
-        state = str(row.get('NM_UF', '')).strip()
+    def _search_cep_by_address(self, df: pd.DataFrame, idx: int) -> Optional[str]:
+        """
+        Busca CEP correto usando endereço através da API ViaCEP
+        
+        Procura por: DS_ENDERECO (ou NM_LOGRADOURO), DS_BAIRRO, NM_CIDADE (ou NM_MUNICIPIO), NM_UF
+        """
+        row = df.iloc[idx]
+        
+        # Tenta encontrar o endereço nos campos disponíveis
+        street = (str(row.get('DS_ENDERECO', '') or row.get('NM_LOGRADOURO', '')).strip())
+        neighborhood = (str(row.get('DS_BAIRRO', '') or row.get('NM_BAIRRO', '')).strip())
+        city = (str(row.get('NM_CIDADE', '') or row.get('NM_MUNICIPIO', '')).strip())
+        state = (str(row.get('NM_UF', '')).strip())
         
         if not street or not city or not state:
+            logger.debug(f"Linha {idx}: Endereço incompleto para busca de CEP")
             return None
         
         try:
             # Usa API ViaCEP para buscar endereços (formato: UF/cidade/logradouro)
-            # Exemplo: https://viacep.com.br/ws/SP/São Paulo/Paulista/json/
+            from urllib.parse import quote
             import requests
             
-            # Normaliza strings para URL
-            from urllib.parse import quote
             state_encoded = quote(state)
             city_encoded = quote(city)
             street_encoded = quote(street)
             
             url = f"https://viacep.com.br/ws/{state_encoded}/{city_encoded}/{street_encoded}/json/"
             
+            logger.debug(f"Buscando CEP: {url}")
             self.cep_validator._apply_rate_limit()
             response = requests.get(url, timeout=10)
             
@@ -736,13 +786,25 @@ class CSVProcessor:
                 
                 # ViaCEP retorna array de resultados
                 if isinstance(data, list) and len(data) > 0:
-                    # Pega o primeiro resultado
+                    # Filtra por bairro se disponível (maior precisão)
+                    if neighborhood:
+                        for item in data:
+                            if neighborhood.lower() in item.get('bairro', '').lower():
+                                cep = item.get('cep', '').replace('-', '')
+                                logger.info(f"CEP encontrado (por bairro): {cep} para {street}, {neighborhood}, {city}/{state}")
+                                return cep
+                    
+                    # Se não encontrar por bairro, usa o primeiro resultado
                     cep = data[0].get('cep', '').replace('-', '')
-                    if cep:
-                        logger.info(f"CEP encontrado para {street}, {city}/{state}: {cep}")
-                        return cep
+                    logger.info(f"CEP encontrado (primeiro resultado): {cep} para {street}, {city}/{state}")
+                    return cep
+                else:
+                    logger.debug(f"Nenhum CEP encontrado para: {street}, {city}/{state}")
+            else:
+                logger.warning(f"Erro ao buscar CEP: status {response.status_code}")
+        
         except Exception as e:
-            logger.warning(f"Erro ao buscar CEP por endereço: {str(e)}")
+            logger.warning(f"Erro ao buscar CEP por endereço (linha {idx}): {str(e)}")
         
         return None
     
@@ -765,10 +827,11 @@ class CSVProcessor:
     def _get_coordinates_by_address(self, row: pd.Series) -> Optional[tuple]:
         """Busca coordenadas usando endereço completo"""
         try:
-            street = str(row.get('NM_LOGRADOURO', '')).strip()
-            neighborhood = str(row.get('NM_BAIRRO', '')).strip()
-            city = str(row.get('NM_MUNICIPIO', '')).strip()
-            state = str(row.get('NM_UF', '')).strip()
+            # Tenta usar dados do ViaCEP primeiro, depois dados originais
+            street = str(row.get('logradouro', '') or row.get('NM_LOGRADOURO', '')).strip()
+            neighborhood = str(row.get('bairro', '') or row.get('NM_BAIRRO', '')).strip()
+            city = str(row.get('cidade', '') or row.get('NM_MUNICIPIO', '')).strip()
+            state = str(row.get('uf', '') or row.get('NM_UF', '')).strip()
             
             if not street or not city:
                 return None
@@ -782,20 +845,20 @@ class CSVProcessor:
     def _get_coordinates_with_fallback(self, row: pd.Series) -> Optional[tuple]:
         """
         Busca coordenadas usando múltiplas estratégias de fallback
-        Prioriza dados corretos e tenta combinações mais específicas primeiro
+        Prioriza dados corretos do ViaCEP e tenta combinações mais específicas primeiro
         """
         try:
-            # Pega campos corretos primeiro, depois originais como fallback
-            cep_correto = row.get('CD_CEP_CORRETO', '')
-            logradouro = str(row.get('NM_LOGRADOURO_CORRETO', '') or row.get('NM_LOGRADOURO', '')).strip()
-            bairro = str(row.get('NM_BAIRRO_CORRETO', '') or row.get('NM_BAIRRO', '')).strip()
-            municipio = str(row.get('NM_MUNICIPIO_CORRETO', '') or row.get('NM_MUNICIPIO', '')).strip()
-            uf = str(row.get('NM_UF_CORRETO', '') or row.get('NM_UF', '')).strip()
+            # Dados do ViaCEP (já validados)
+            cep_corrigido = row.get('cep_corrigido', '')
+            logradouro = str(row.get('logradouro', '') or row.get('NM_LOGRADOURO', '')).strip()
+            bairro = str(row.get('bairro', '') or row.get('NM_BAIRRO', '')).strip()
+            municipio = str(row.get('cidade', '') or row.get('NM_MUNICIPIO', '')).strip()
+            uf = str(row.get('uf', '') or row.get('NM_UF', '')).strip()
             
-            # Estratégia 1: CEP correto + cidade
-            if cep_correto and municipio:
-                logger.debug(f"Tentando: CEP {cep_correto} + {municipio}")
-                coords = self.geocoder.search_by_cep(cep_correto, municipio, "BR")
+            # Estratégia 1: CEP corrigido + cidade
+            if cep_corrigido and municipio:
+                logger.debug(f"Tentando: CEP {cep_corrigido} + {municipio}")
+                coords = self.geocoder.search_by_cep(cep_corrigido, municipio, "BR")
                 if coords:
                     logger.debug(f"✓ Encontrado por CEP + cidade")
                     return coords

@@ -263,6 +263,9 @@ class CSVProcessor:
                 df.at[idx, 'bairro'] = cep_info.get('bairro', '')
                 df.at[idx, 'cidade'] = cep_info.get('localidade', '')
                 df.at[idx, 'uf'] = cep_info.get('uf', '')
+
+                # Usa o CEP corrigido para preencher colunas originais vazias
+                self._backfill_row_from_cep(df, idx, cep_info)
             else:
                 # CEP inválido
                 df.at[idx, 'cep_valido'] = False
@@ -361,6 +364,54 @@ class CSVProcessor:
             df.loc[fill_mask, col] = source_series[fill_mask]
 
         return df
+
+    def _backfill_row_from_cep(self, df: pd.DataFrame, idx: int, cep_info: Dict[str, str]) -> None:
+        """Preenche colunas de endereço existentes que estejam vazias usando dados do CEP.
+
+        Isso garante que, ao corrigir um CEP, as colunas originais do usuário
+        (ex.: `NM_LOGRADOURO`, `NM_BAIRRO`, `NM_MUNICIPIO`, `NM_UF`) também sejam
+        preenchidas caso estejam em branco.
+        """
+
+        if cep_info is None:
+            return
+
+        # Valores vindos do ViaCEP
+        street = cep_info.get('logradouro', '') or ''
+        bairro = cep_info.get('bairro', '') or ''
+        city = cep_info.get('localidade', '') or ''
+        uf = cep_info.get('uf', '') or ''
+
+        # Mapeamentos canônicos para escrita (case-insensitive)
+        street_targets = {
+            'NM_LOGRADOURO', 'NM_LOGRADOURO_ATUAL', 'NM_LOGRADOURO_COR',
+            'NM_ENDERECO', 'NM_ENDERECO_ATUAL', 'DS_LOGRADOURO', 'DS_ENDERECO',
+            'logradouro', 'endereco', 'rua'
+        }
+        bairro_targets = {
+            'NM_BAIRRO', 'NM_BAIRRO_ATUAL', 'DS_BAIRRO', 'bairro'
+        }
+        city_targets = {
+            'NM_MUNICIPIO', 'NM_MUNICIPIO_ATUAL', 'DS_MUNICIPIO', 'NM_CIDADE',
+            'cidade', 'municipio'
+        }
+        uf_targets = {
+            'NM_UF', 'NM_UF_ATUAL', 'DS_UF', 'UF', 'estado', 'sigla_uf'
+        }
+
+        def maybe_fill(column_set, value):
+            if not value:
+                return
+            for col in df.columns:
+                if col.lower() in {c.lower() for c in column_set}:
+                    current = df.at[idx, col]
+                    if pd.isna(current) or str(current).strip() == '':
+                        df.at[idx, col] = value
+
+        maybe_fill(street_targets, street)
+        maybe_fill(bairro_targets, bairro)
+        maybe_fill(city_targets, city)
+        maybe_fill(uf_targets, uf)
     
     def _find_cep_column(self, df: pd.DataFrame) -> Optional[str]:
         """Encontra a coluna de CEP no DataFrame"""

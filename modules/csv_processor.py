@@ -266,6 +266,9 @@ class CSVProcessor:
 
                 # Usa o CEP corrigido para preencher colunas originais vazias
                 self._backfill_row_from_cep(df, idx, cep_info)
+
+                # Se ViaCEP não trouxe logradouro/bairro, tenta usar o endereço original padronizado
+                self._backfill_from_original(df, idx)
             else:
                 # CEP inválido
                 df.at[idx, 'cep_valido'] = False
@@ -282,16 +285,34 @@ class CSVProcessor:
             logger.info("Buscando coordenadas (LENTO - pode levar minutos)...")
             phase2_start = time.time()
             
-            df['latitude'] = None
-            df['longitude'] = None
+            # Colunas de destino
+            df['DS_LATITUDE_CORRETA'] = None
+            df['DS_LONGITUDE_CORRETA'] = None
+            # Mantém também latitude/longitude se já existirem
+            if 'DS_LATITUDE' not in df.columns:
+                df['DS_LATITUDE'] = None
+            if 'DS_LONGITUDE' not in df.columns:
+                df['DS_LONGITUDE'] = None
             
-            # Apenas processa CEPs válidos
-            for idx, row in df[df['cep_valido'] == True].iterrows():
-                cep = str(row[cep_col]).strip()
-                coords = self._get_coordinates_with_fallback(row)
+            for idx, row in df.iterrows():
+                coords = None
+                if row.get('cep_valido'):
+                    # Tenta com CEP corrigido e endereço corrigido
+                    coords = self._get_coordinates_with_fallback(row)
+                else:
+                    # Se CEP não é válido, tenta usar endereço original/corrigido
+                    coords = self._get_coordinates_by_address(row)
+                
                 if coords:
-                    df.at[idx, 'latitude'] = coords.get('latitude')
-                    df.at[idx, 'longitude'] = coords.get('longitude')
+                    lat, lon = coords[0], coords[1]
+                    df.at[idx, 'DS_LATITUDE_CORRETA'] = lat
+                    df.at[idx, 'DS_LONGITUDE_CORRETA'] = lon
+                    # Preenche colunas principais se estiverem vazias
+                    if pd.isna(df.at[idx, 'DS_LATITUDE']) or str(df.at[idx, 'DS_LATITUDE']).strip() == '':
+                        df.at[idx, 'DS_LATITUDE'] = lat
+                    if pd.isna(df.at[idx, 'DS_LONGITUDE']) or str(df.at[idx, 'DS_LONGITUDE']).strip() == '':
+                        df.at[idx, 'DS_LONGITUDE'] = lon
+                    self.stats['found_coordinates'] += 1
             
             logger.info(f"✓ Coordenadas buscadas em {time.time()-phase2_start:.1f}s")
         
@@ -412,6 +433,61 @@ class CSVProcessor:
         maybe_fill(bairro_targets, bairro)
         maybe_fill(city_targets, city)
         maybe_fill(uf_targets, uf)
+
+    def _backfill_from_original(self, df: pd.DataFrame, idx: int) -> None:
+        """Padroniza e usa endereço original para preencher lacunas quando o CEP corrigido não traz dados.
+
+        - Normaliza logradouro com a função interna de normalização.
+        - Normaliza bairro/cidade/UF com title-case simples.
+        """
+
+        def first_non_empty(column_set):
+            target_lower = {c.lower() for c in column_set}
+            for col in df.columns:
+                if col.lower() in target_lower:
+                    val = df.at[idx, col]
+                    if not pd.isna(val):
+                        val_str = str(val).strip()
+                        if val_str:
+                            return val_str
+            return ''
+
+        def norm_simple(text: str) -> str:
+            text = str(text).strip()
+            if not text:
+                return ''
+            return ' '.join(word.capitalize() for word in text.split())
+
+        street_targets = {
+            'NM_LOGRADOURO', 'NM_LOGRADOURO_ATUAL', 'NM_LOGRADOURO_COR',
+            'NM_ENDERECO', 'NM_ENDERECO_ATUAL', 'DS_LOGRADOURO', 'DS_ENDERECO',
+            'logradouro', 'endereco', 'rua'
+        }
+        bairro_targets = {
+            'NM_BAIRRO', 'NM_BAIRRO_ATUAL', 'DS_BAIRRO', 'bairro'
+        }
+        city_targets = {
+            'NM_MUNICIPIO', 'NM_MUNICIPIO_ATUAL', 'DS_MUNICIPIO', 'NM_CIDADE',
+            'cidade', 'municipio'
+        }
+        uf_targets = {
+            'NM_UF', 'NM_UF_ATUAL', 'DS_UF', 'UF', 'estado', 'sigla_uf'
+        }
+
+        # Só age se estiver vazio o núcleo (logradouro/bairro) preenchido pelo CEP
+        street_candidate = first_non_empty(street_targets)
+        bairro_candidate = first_non_empty(bairro_targets)
+        city_candidate = first_non_empty(city_targets)
+        uf_candidate = first_non_empty(uf_targets)
+
+        if (not df.at[idx, 'logradouro']) and street_candidate:
+            df.at[idx, 'logradouro'] = self._normalize_address(street_candidate)
+        if (not df.at[idx, 'bairro']) and bairro_candidate:
+            df.at[idx, 'bairro'] = norm_simple(bairro_candidate)
+        if (not df.at[idx, 'cidade']) and city_candidate:
+            df.at[idx, 'cidade'] = norm_simple(city_candidate)
+        if (not df.at[idx, 'uf']) and uf_candidate:
+            df.at[idx, 'uf'] = uf_candidate.strip().upper()
     
     def _find_cep_column(self, df: pd.DataFrame) -> Optional[str]:
         """Encontra a coluna de CEP no DataFrame"""

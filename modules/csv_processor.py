@@ -53,6 +53,7 @@ class CSVProcessor:
         self.col_mapping = col_mapping or {}
         self.detected_encoding = None
         self.detected_delimiter = None
+        self.stop_processing = False  # ✅ Flag para parar processamento
         
         self.stats = {
             'total_rows': 0,
@@ -61,6 +62,20 @@ class CSVProcessor:
             'found_coordinates': 0,
             'errors': []
         }
+    
+    def stop(self):
+        """Para o processamento gracefully"""
+        self.stop_processing = True
+        logger.info("⛔ Solicitação de parada recebida")
+    
+    def resume(self):
+        """Retoma o processamento"""
+        self.stop_processing = False
+        logger.info("▶️ Processamento retomado")
+    
+    def is_stopped(self) -> bool:
+        """Verifica se o processamento foi parado"""
+        return self.stop_processing
     
     def _detect_encoding(self, file_path: str, sample_size: int = 100000) -> str:
         """Detecta o encoding do arquivo automaticamente"""
@@ -259,6 +274,11 @@ class CSVProcessor:
         # Processa cada linha
         total_rows = len(df)
         for idx, row in df.iterrows():
+            # Verifica se foi solicitado parar
+            if self.stop_processing:
+                logger.warning(f"⛔ Processamento interrompido na linha {idx + 1}/{total_rows}")
+                break
+            
             cep_original = str(row[cep_col]).strip()
             
             # Tenta buscar informações do CEP via ViaCEP
@@ -328,6 +348,11 @@ class CSVProcessor:
                 df['DS_LONGITUDE'] = None
             
             for idx, row in df.iterrows():
+                # Verifica se foi solicitado parar
+                if self.stop_processing:
+                    logger.warning(f"⛔ Busca de coordenadas interrompida na linha {idx + 1}/{len(df)}")
+                    break
+                
                 coords = None
                 if row.get('cep_valido'):
                     # Tenta com CEP corrigido e endereço corrigido

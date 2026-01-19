@@ -48,7 +48,8 @@ initialize_session_state({
     'result_df': None,
     'stats': None,
     'file_processed': False,
-    'file_info': None
+    'file_info': None,
+    'processing_active': False  # ✅ Flag para controlar processamento
 })
 
 # Título
@@ -88,7 +89,22 @@ with tab1:
         st.info(f"📄 Arquivo: {uploaded_file.name} ({file_size_mb:.2f} MB)")
         
         # Botão de processar
-        if st.button("🚀 Processar Arquivo", type="primary"):
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            if st.button("🚀 Processar Arquivo", type="primary", key="process_btn"):
+                st.session_state.processing_active = True
+        
+        with col2:
+            if st.session_state.processing_active:
+                if st.button("⛔ Parar Processamento", type="secondary"):
+                    if st.session_state.processor:
+                        st.session_state.processor.stop()
+                        st.session_state.processing_active = False
+                        st.warning("⛔ Processamento foi interrompido!")
+                        st.rerun()
+        
+        if st.session_state.processing_active:
             try:
                 with st.spinner("Processando dados..."):
                     # Cria processador
@@ -100,6 +116,9 @@ with tab1:
                         cache_db=config.processing.cache_db_path,
                         fetch_coordinates=True  # ✅ Busca automática de coordenadas
                     )
+                    
+                    # Armazena processador na session para parada
+                    st.session_state.processor = processor
                     
                     # Container para progresso
                     progress_container = st.container()
@@ -122,14 +141,20 @@ with tab1:
                     st.session_state.result_df = result_df
                     st.session_state.stats = processor.stats
                     st.session_state.file_processed = True
+                    st.session_state.processing_active = False
                     
                     # Limpa progresso
                     progress_bar.empty()
                     status_text.empty()
                     
-                    show_success_message("Processamento concluído com sucesso!")
+                    # Verifica se foi interrompido
+                    if processor.is_stopped():
+                        show_info_message(f"⛔ Processamento interrompido! {processor.stats['processed_rows']} linhas foram processadas.")
+                    else:
+                        show_success_message("Processamento concluído com sucesso!")
             
             except Exception as e:
+                st.session_state.processing_active = False
                 show_error_message(f"Erro ao processar arquivo: {str(e)}")
         
         # Exibe resultados se já processado

@@ -32,6 +32,10 @@ if 'processed_data' not in st.session_state:
     st.session_state.processed_data = None
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
+if 'processor' not in st.session_state:
+    st.session_state.processor = None  # ✅ Para armazenar o processador
+if 'processing_active' not in st.session_state:
+    st.session_state.processing_active = False  # ✅ Flag de processamento ativo
 
 st.title("🌍 GeoGrafi - Validação e Correção de CEPs")
 
@@ -115,7 +119,21 @@ if uploaded_file:
                 uploaded_file.seek(0)
     
     # Botão de processar
-    if st.button("▶️ Processar Arquivo", key="process_btn"):
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        if st.button("▶️ Processar Arquivo", key="process_btn"):
+            st.session_state.processing_active = True
+    
+    with col2:
+        if st.session_state.processing_active:
+            if st.button("⛔ Parar", key="stop_btn"):
+                if st.session_state.processor:
+                    st.session_state.processor.stop()
+                    st.session_state.processing_active = False
+                    st.warning("⛔ Processamento interrompido!")
+    
+    if st.session_state.processing_active:
         with st.spinner("⏳ Processando arquivo..."):
             try:
                 # Salva arquivo temporário
@@ -132,15 +150,25 @@ if uploaded_file:
                     fetch_coordinates=True  # ✅ Busca automática de coordenadas
                 )
                 
+                # Armazena na session para parada
+                st.session_state.processor = processor
+                
                 # Processa
                 result = processor.process_file(tmp_path)
                 
                 st.session_state.processed_data = result
                 st.session_state.processing_complete = True
+                st.session_state.processing_active = False
+                
+                if processor.is_stopped():
+                    st.warning(f"⛔ Processamento interrompido! {processor.stats['processed_rows']} linhas processadas")
+                else:
+                    st.success(f"Processamento completo: {len(result)} linhas")
                 
                 logger.info(f"Processamento completo: {len(result)} linhas")
                 
             except Exception as e:
+                st.session_state.processing_active = False
                 st.error(f"❌ Erro ao processar: {str(e)}")
                 logger.exception("Erro no processamento")
 

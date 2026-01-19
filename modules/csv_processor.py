@@ -26,7 +26,8 @@ class CSVProcessor:
         max_workers: int = 3,
         use_cache: bool = True,
         cache_db: str = "cache.db",
-        col_mapping: Optional[Dict[str, str]] = None
+        col_mapping: Optional[Dict[str, str]] = None,
+        fetch_coordinates: bool = False
     ):
         """
         Inicializa o processador
@@ -37,11 +38,13 @@ class CSVProcessor:
             use_cache: Usar cache local
             cache_db: Caminho do banco de cache
             col_mapping: Mapeamento de colunas alternativas -> nomes esperados
+            fetch_coordinates: Se deve buscar coordenadas (lento, usa Nominatim)
         """
         self.chunk_size = chunk_size
         self.max_workers = max_workers
+        self.fetch_coordinates = fetch_coordinates  # NOVO: controlar busca de coordenadas
         self.cep_validator = CEPValidator(rate_limit_delay=0.15)
-        self.geocoder = Geocoder(rate_limit_delay=1.5)
+        self.geocoder = Geocoder(rate_limit_delay=1.5) if fetch_coordinates else None
         self.cache_manager = CacheManager(cache_db) if use_cache else None
         self.col_mapping = col_mapping or {}
         self.detected_encoding = None
@@ -88,6 +91,32 @@ class CSVProcessor:
         except Exception as e:
             logger.warning(f"Erro ao detectar delimitador: {e}. Usando vírgula")
             return ','
+    
+    def _validate_cep_quick(self, cep: str) -> bool:
+        """
+        Valida CEP de forma rápida (apenas formato, sem chamada de API)
+        
+        Returns:
+            True se CEP tem formato válido (8 dígitos)
+        """
+        import re
+        if not cep:
+            return False
+        
+        # Remove caracteres não-numéricos
+        cep_limpo = re.sub(r'\D', '', str(cep))
+        
+        # Verifica se tem 8 dígitos e não é sequência inválida
+        if len(cep_limpo) != 8:
+            return False
+        
+        # CEPs inválidos óbvios
+        if cep_limpo in ['00000000', '11111111', '22222222', '33333333', 
+                         '44444444', '55555555', '66666666', '77777777',
+                         '88888888', '99999999']:
+            return False
+        
+        return True
     
     def _normalize_address(self, text: str) -> str:
         """Normaliza e padroniza endereços"""
@@ -152,51 +181,226 @@ class CSVProcessor:
         
         return text.strip()
     
-    def process_file(
-        self,
-        file_path: str,
-        output_path: Optional[str] = None,
-        progress_callback: Optional[Callable] = None
-    ) -> Dict:
+    def process_file(self, file_path: str) -> pd.DataFrame:
         """
-        Processa arquivo CSV completo
+        Processa arquivo CSV RAPIDAMENTE.
         
-        Args:
-            file_path: Caminho do arquivo CSV
-            output_path: Caminho para salvar arquivo processado
-            progress_callback: Função para reportar progresso
-            
+        Se fetch_coordinates=False (padrão): Apenas valida CEPs (~0.1s por item)
+        Se fetch_coordinates=True: Também busca coordenadas (LENTO: ~2-3s por item)
+        
         Returns:
-            Dicionário com estatísticas
+            DataFrame com coluna 'cep_valido' adicionada
         """
-        # Lê arquivo em chunks
-        chunks = self._read_csv_chunks(file_path)
+        import time
         
-        results = []
-        for i, chunk in enumerate(chunks):
-            logger.info(f"Processando chunk {i+1}...")
+        logger.info(f"Iniciando processamento: {file_path}")
+        start = time.time()
+        
+        # Detecção automática de encoding/delimiter
+        if not self.detected_encoding:
+            self.detected_encoding = self._detect_encoding(file_path)
+        if not self.detected_delimiter:
+            self.detected_delimiter = self._detect_delimiter(file_path, self.detected_encoding)
+        
+        logger.info(f"Encoding: {self.detected_encoding}, Delimitador: '{self.detected_delimiter}'")
+        
+        # Lê arquivo completo de uma vez (para manter simples)
+        try:
+            df = pd.read_csv(
+                file_path,
+                encoding=self.detected_encoding,
+                encoding_errors='replace',
+                delimiter=self.detected_delimiter,
+                quotechar='"',
+                skipinitialspace=True,
+                on_bad_lines='warn',
+                dtype=str  # 🔑 IMPORTANTE: Lê tudo como string para preservar zeros à esquerda
+            )
+        except Exception as e:
+            logger.error(f"Erro ao ler CSV: {e}")
+            raise
+        
+        logger.info(f"Arquivo carregado: {len(df)} linhas")
+        logger.info(f"Colunas detectadas: {list(df.columns)}")
+        
+        # Identifica coluna de CEP
+        cep_col = self._find_cep_column(df)
+        if not cep_col:
+            colunas_disponiveis = ", ".join([f"'{col}'" for col in df.columns])
+            raise ValueError(
+                f"❌ Coluna de CEP não encontrada!\n\n"
+                f"Colunas disponíveis no arquivo: {colunas_disponiveis}\n\n"
+                f"Dica: Renomeie uma coluna para 'cep' ou 'CEP' no seu arquivo CSV."
+            )
+        
+        logger.info(f"Coluna de CEP encontrada: '{cep_col}'")
+        
+        # FASE 1: Validação e Correção de CEPs
+        logger.info("Validando e corrigindo CEPs...")
+        phase1_start = time.time()
+        
+        # Adiciona colunas para resultados
+        df['cep_original'] = df[cep_col].astype(str)
+        df['cep_valido'] = False
+        df['cep_corrigido'] = None
+        df['logradouro'] = None
+        df['bairro'] = None
+        df['cidade'] = None
+        df['uf'] = None
+        
+        # Processa cada linha
+        for idx, row in df.iterrows():
+            cep_original = str(row[cep_col]).strip()
             
-            processed_chunk = self._process_chunk(chunk)
-            results.append(processed_chunk)
+            # Tenta buscar informações do CEP via ViaCEP
+            cep_info = self.cep_validator.search_cep(cep_original)
             
-            self.stats['processed_rows'] += len(chunk)
+            if cep_info and not cep_info.get('erro'):
+                # CEP válido encontrado
+                df.at[idx, 'cep_valido'] = True
+                df.at[idx, 'cep_corrigido'] = cep_info.get('cep', cep_original)
+                df.at[idx, 'logradouro'] = cep_info.get('logradouro', '')
+                df.at[idx, 'bairro'] = cep_info.get('bairro', '')
+                df.at[idx, 'cidade'] = cep_info.get('localidade', '')
+                df.at[idx, 'uf'] = cep_info.get('uf', '')
+            else:
+                # CEP inválido
+                df.at[idx, 'cep_valido'] = False
+                df.at[idx, 'cep_corrigido'] = cep_original
+
+        # Preenche campos vazios de endereço a partir das informações corrigidas do CEP
+        df = self._fill_missing_address_fields(df)
+        
+        valid_count = (df['cep_valido'] == True).sum()
+        logger.info(f"✓ {valid_count}/{len(df)} CEPs válidos em {time.time()-phase1_start:.1f}s")
+        
+        # FASE 2: Busca de coordenadas (OPCIONAL - MUITO LENTA)
+        if self.fetch_coordinates and self.geocoder:
+            logger.info("Buscando coordenadas (LENTO - pode levar minutos)...")
+            phase2_start = time.time()
             
-            if progress_callback:
-                progress = (self.stats['processed_rows'] / self.stats['total_rows']) * 100
-                progress_callback(progress)
+            df['latitude'] = None
+            df['longitude'] = None
+            
+            # Apenas processa CEPs válidos
+            for idx, row in df[df['cep_valido'] == True].iterrows():
+                cep = str(row[cep_col]).strip()
+                coords = self._get_coordinates_with_fallback(row)
+                if coords:
+                    df.at[idx, 'latitude'] = coords.get('latitude')
+                    df.at[idx, 'longitude'] = coords.get('longitude')
+            
+            logger.info(f"✓ Coordenadas buscadas em {time.time()-phase2_start:.1f}s")
         
-        # Combina resultados
-        final_df = pd.concat(results, ignore_index=True)
+        total = time.time() - start
+        logger.info(f"✓ Processamento concluído em {total:.1f}s")
         
-        # Salva arquivo
-        if output_path:
-            final_df.to_csv(output_path, index=False, encoding='utf-8')
-            logger.info(f"Arquivo salvo em: {output_path}")
-        
-        return {
-            'dataframe': final_df,
-            'stats': self.stats
+        return df
+
+    def _fill_missing_address_fields(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Preenche campos de endereço vazios usando dados do ViaCEP.
+
+        - Usa apenas linhas com `cep_valido == True`
+        - Mantém valores existentes; só preenche quando está vazio ou NaN
+        """
+
+        # Se não houver flag de CEP válido ou dados básicos, sai cedo
+        if 'cep_valido' not in df.columns:
+            return df
+
+        has_base_fields = all(col in df.columns for col in ['logradouro', 'bairro', 'cidade', 'uf'])
+        if not has_base_fields:
+            return df
+
+        # Conjuntos de colunas equivalentes (case-insensitive)
+        street_cols = {
+            'logradouro', 'endereco', 'rua', 'ds_endereco', 'ds_logradouro',
+            'nm_logradouro', 'nm_logradouro_atual', 'nm_logradouro_cor',
+            'nm_endereco', 'nm_endereco_atual'
         }
+        bairro_cols = {
+            'bairro', 'ds_bairro', 'nm_bairro', 'nm_bairro_atual'
+        }
+        city_cols = {
+            'cidade', 'municipio', 'nm_cidade', 'nm_municipio', 'ds_municipio'
+        }
+        uf_cols = {
+            'uf', 'estado', 'sigla_uf', 'nm_uf', 'ds_uf'
+        }
+
+        def is_empty(value: object) -> bool:
+            """Retorna True se valor for NaN ou string vazia."""
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return True
+            if isinstance(value, str):
+                return value.strip() == ''
+            return False
+
+        # Máscara para linhas válidas
+        mask_valid = df['cep_valido'] == True
+
+        for col in df.columns:
+            key = col.lower()
+            if key in street_cols:
+                source_series = df['logradouro']
+            elif key in bairro_cols:
+                source_series = df['bairro']
+            elif key in city_cols:
+                source_series = df['cidade']
+            elif key in uf_cols:
+                source_series = df['uf']
+            else:
+                continue
+
+            # Define máscara de valores vazios na coluna alvo
+            target_series = df[col]
+            mask_empty = target_series.apply(is_empty)
+
+            # Só preenche onde: linha é válida e célula está vazia
+            fill_mask = mask_valid & mask_empty & source_series.notna() & (source_series.astype(str).str.strip() != '')
+            df.loc[fill_mask, col] = source_series[fill_mask]
+
+        return df
+    
+    def _find_cep_column(self, df: pd.DataFrame) -> Optional[str]:
+        """Encontra a coluna de CEP no DataFrame"""
+        logger.debug(f"Colunas disponíveis: {list(df.columns)}")
+        
+        # Lista expandida de nomes possíveis
+        common_names = [
+            'cep', 'CEP', 'Cep',
+            'cd_cep', 'CD_CEP', 'Cd_Cep', 'cd_CEP',
+            'codigo_cep', 'CODIGO_CEP', 'Codigo_Cep', 'codigo_CEP',
+            'codigo', 'CODIGO', 'Codigo',
+            'postal_code', 'POSTAL_CODE', 'Postal_Code',
+            'zipcode', 'ZIPCODE', 'ZipCode', 'Zipcode',
+            'zip', 'ZIP', 'Zip',
+            'codigo postal', 'CODIGO POSTAL', 'Codigo Postal'
+        ]
+        
+        # Busca exata
+        for col in df.columns:
+            if col in common_names:
+                logger.debug(f"Coluna encontrada (match exato): '{col}'")
+                return col
+        
+        # Busca case-insensitive
+        df_lower = {col.lower(): col for col in df.columns}
+        for name in common_names:
+            if name.lower() in df_lower:
+                found_col = df_lower[name.lower()]
+                logger.debug(f"Coluna encontrada (case-insensitive): '{found_col}'")
+                return found_col
+        
+        # Busca parcial (contém 'cep')
+        for col in df.columns:
+            col_lower = col.lower()
+            if 'cep' in col_lower or 'postal' in col_lower or 'zip' in col_lower:
+                logger.debug(f"Coluna encontrada (busca parcial): '{col}'")
+                return col
+        
+        logger.warning(f"Coluna de CEP não encontrada. Colunas disponíveis: {list(df.columns)}")
+        return None
     
     def _read_csv_chunks(self, file_path: str) -> Iterator[pd.DataFrame]:
         """Lê arquivo CSV em chunks"""
@@ -463,45 +667,45 @@ class CSVProcessor:
             
             # Estratégia 1: CEP correto + cidade
             if cep_correto and municipio:
-                logger.info(f"Tentando: CEP {cep_correto} + {municipio}")
+                logger.debug(f"Tentando: CEP {cep_correto} + {municipio}")
                 coords = self.geocoder.search_by_cep(cep_correto, municipio, "BR")
                 if coords:
-                    logger.info(f"✓ Encontrado por CEP + cidade")
+                    logger.debug(f"✓ Encontrado por CEP + cidade")
                     return coords
             
             # Estratégia 2: Endereço completo (logradouro + bairro + cidade + UF)
             if logradouro and municipio:
-                logger.info(f"Tentando: {logradouro}, {bairro}, {municipio}/{uf}")
+                logger.debug(f"Tentando: {logradouro}, {bairro}, {municipio}/{uf}")
                 coords = self.geocoder.search_by_address(logradouro, "", bairro, municipio, uf)
                 if coords:
-                    logger.info(f"✓ Encontrado por endereço completo")
+                    logger.debug(f"✓ Encontrado por endereço completo")
                     return coords
             
             # Estratégia 3: Logradouro + cidade + UF (sem bairro)
             if logradouro and municipio and uf:
-                logger.info(f"Tentando: {logradouro}, {municipio}/{uf}")
+                logger.debug(f"Tentando: {logradouro}, {municipio}/{uf}")
                 coords = self.geocoder.search_by_address(logradouro, "", "", municipio, uf)
                 if coords:
-                    logger.info(f"✓ Encontrado por logradouro + cidade")
+                    logger.debug(f"✓ Encontrado por logradouro + cidade")
                     return coords
             
             # Estratégia 4: Apenas bairro + cidade + UF
             if bairro and municipio and uf:
-                logger.info(f"Tentando: {bairro}, {municipio}/{uf}")
+                logger.debug(f"Tentando: {bairro}, {municipio}/{uf}")
                 coords = self.geocoder.search_by_address("", "", bairro, municipio, uf)
                 if coords:
-                    logger.info(f"✓ Encontrado por bairro + cidade")
+                    logger.debug(f"✓ Encontrado por bairro + cidade")
                     return coords
             
             # Estratégia 5: Apenas cidade + UF (coordenadas do centro da cidade)
             if municipio and uf:
-                logger.info(f"Tentando: {municipio}/{uf}")
+                logger.debug(f"Tentando: {municipio}/{uf}")
                 coords = self.geocoder.search_by_address("", "", "", municipio, uf)
                 if coords:
-                    logger.info(f"✓ Encontrado centro da cidade")
+                    logger.debug(f"✓ Encontrado centro da cidade")
                     return coords
             
-            logger.warning(f"Nenhuma coordenada encontrada para: {municipio}")
+            logger.debug(f"Nenhuma coordenada encontrada para: {municipio}")
             return None
         
         except Exception as e:

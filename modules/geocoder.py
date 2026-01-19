@@ -18,11 +18,11 @@ class Geocoder:
     """Busca coordenadas usando Nominatim (OpenStreetMap)"""
     
     BASE_URL = "https://nominatim.openstreetmap.org/search"
-    TIMEOUT = 20  # Aumentado para 20s
-    RETRY_ATTEMPTS = 3
-    RETRY_DELAY = 3  # Nominatim é mais restritivo
+    TIMEOUT = 30  # Timeout maior
+    RETRY_ATTEMPTS = 2  # Menos tentativas para evitar timeout
+    RETRY_DELAY = 2  # Delay entre tentativas
     
-    def __init__(self, rate_limit_delay: float = 1.5, app_name: str = "GeoGrafi"):
+    def __init__(self, rate_limit_delay: float = 2.0, app_name: str = "GeoGrafi"):
         """
         Inicializa o geocoder
         
@@ -193,10 +193,10 @@ class Geocoder:
                     data = response.json()
                     if data and len(data) > 0:
                         result = (float(data[0]['lat']), float(data[0]['lon']))
-                        logger.info(f"Encontrado: {query} -> {result}")
+                        logger.debug(f"Encontrado: {query} -> {result}")
                         return result
                     else:
-                        logger.warning(f"Nenhum resultado para: {query}")
+                        logger.debug(f"Nenhum resultado para: {query}")
                         return None
                 else:
                     logger.warning(f"Status {response.status_code} para: {query}")

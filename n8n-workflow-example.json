@@ -1,0 +1,125 @@
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "1",
+      "name": "Start",
+      "type": "n8n-nodes-base.start",
+      "typeVersion": 1,
+      "position": [50, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8501/api/process",
+        "authentication": "genericCredentialType",
+        "genericAuth": {
+          "authType": "bearerToken",
+          "bearerToken": "{{ $secret.GEOGRAFI_API_KEY }}"
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "file",
+              "value": "=data:text/csv;base64,{{ $node[\"Read_CSV\"].data.binary.csv }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "2",
+      "name": "Process with GeoGrafi",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "spreadsheet",
+        "resource": "spreadsheet",
+        "spreadsheetId": "{{ $secret.GOOGLE_SHEET_ID }}",
+        "range": "Dados!A1",
+        "input": "={{ JSON.stringify($node[\"Process with GeoGrafi\"].json.data) }}"
+      },
+      "id": "3",
+      "name": "Write to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "{{ $secret.WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "status",
+              "value": "success"
+            },
+            {
+              "name": "rows_processed",
+              "value": "={{ $node[\"Process with GeoGrafi\"].json.rows_processed }}"
+            },
+            {
+              "name": "timestamp",
+              "value": "={{ new Date().toISOString() }}"
+            }
+          ]
+        }
+      },
+      "id": "4",
+      "name": "Notify Success",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [650, 300]
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Process with GeoGrafi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process with GeoGrafi": {
+      "main": [
+        [
+          {
+            "node": "Write to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Notify Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "meta": {
+    "instanceId": "geo_geo_geo",
+    "templateId": "2041"
+  },
+  "versionId": "1"
+}

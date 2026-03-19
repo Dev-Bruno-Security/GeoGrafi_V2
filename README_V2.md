@@ -104,6 +104,8 @@ GeoGrafi_V2/
 │
 ├── app.py                      # Interface Streamlit principal
 ├── exemplos.py                 # Exemplos de uso
+├── test_csv_processor_unit.py   # Testes unitários do CSVProcessor
+├── test_api_key_manager_unit.py # Testes unitários do APIKeyManager
 ├── requirements.txt            # Dependências
 ├── README.md                   # Este arquivo
 └── GUIA_RAPIDO.md             # Guia rápido de uso
@@ -293,6 +295,22 @@ for chunk in reader.read_in_chunks(chunk_size=5000):
     # Processar cada chunk
     print(f"Processando {len(chunk)} linhas...")
 ```
+
+## ✅ Testes Unitários
+
+Para executar os testes unitários consolidados em um único comando:
+
+```bash
+python -m unittest -v test_csv_processor_unit.py test_api_key_manager_unit.py
+```
+
+Esses testes cobrem regras de negócio locais e não dependem de APIs externas.
+
+### Como interpretar o resultado
+
+- Se aparecer `OK` no final, todos os testes passaram.
+- Se aparecer `FAILED`, verifique o nome do teste exibido para identificar o módulo com problema.
+- Mensagens de `warning` (como dependências de biblioteca) não significam falha de teste, apenas alerta de ambiente.
 
 ## 🐛 Solução de Problemas
 

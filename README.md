@@ -43,6 +43,22 @@ O programa irá:
 3. Mostrar informações do arquivo
 4. Apresentar um menu com opções interativas
 
+## ✅ Testes Unitários (GeoGrafi V2)
+
+Para executar os testes unitários consolidados em um unico comando:
+
+```bash
+python -m unittest -v test_csv_processor_unit.py test_api_key_manager_unit.py
+```
+
+Esses testes cobrem regras de negocio locais e nao dependem de APIs externas.
+
+### Como interpretar o resultado
+
+- Se aparecer `OK` no final, todos os testes passaram.
+- Se aparecer `FAILED`, verifique o nome do teste exibido para identificar o modulo com problema.
+- Mensagens de `warning` (como dependencias de biblioteca) nao significam falha de teste, apenas alerta de ambiente.
+
 ### Modo Programático
 
 ```python
